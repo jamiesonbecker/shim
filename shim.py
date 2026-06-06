@@ -352,7 +352,6 @@ def _same_regular_file(path, text, mode=None):
         return False
 
     flags = os.O_RDONLY
-    flags |= getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = None
     try:
@@ -388,7 +387,7 @@ def _same_regular_file(path, text, mode=None):
 
 def _drop_to_user(username):
     pw = pwd.getpwnam(username)
-    # Clear/rebuild supplementary groups before dropping uid/gid.  Refuse to
+    # Clear/rebuild supplementary groups before dropping uid/gid. Refuse to
     # continue if we cannot do this; keeping root's supplementary groups would
     # defeat the purpose of writing user-controlled SSH files as the user.
     if hasattr(os, "initgroups"):
@@ -409,7 +408,7 @@ def _drop_to_user(username):
         raise Exception("refusing to write user file as root")
 
 
-def _write_user_file_child(username, fname, text, mode, mkdir_path=None):
+def _write_user_file_after_drop(username, fname, text, mode, mkdir_path=None):
     _drop_to_user(username)
     old_umask = os.umask(0o077)
     tmpname = None
@@ -485,10 +484,17 @@ def safe_write_user_file(username, fname, text, mode=0o600, mkdir_path=None):
     other path outside their authority, the write fails instead of becoming a
     root file-clobber primitive.
     """
+    # Avoid duplicated pre-fork buffered log output in the child.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
     pid = os.fork()
     if pid == 0:
         try:
-            _write_user_file_child(username, fname, text, mode, mkdir_path)
+            _write_user_file_after_drop(username, fname, text, mode, mkdir_path)
             sys.stdout.flush()
             sys.stderr.flush()
             os._exit(0)
@@ -515,42 +521,6 @@ def safe_write_user_file(username, fname, text, mode=0o600, mkdir_path=None):
             fname, os.WTERMSIG(status)))
     raise Exception("safe user file write for %s failed with status %s" % (
         fname, status))
-
-
-def safe_write_root_file(fname, text, mode=0o644):
-    """Atomically replace a root-owned regular config file."""
-    parent = os.path.dirname(fname)
-    basename = os.path.basename(fname)
-    if not parent or not basename or basename in (".", ".."):
-        raise Exception("unsafe root file path: %s" % fname)
-    fd, tmpname = tempfile.mkstemp(prefix=".%s.userify-tmp." % basename, dir=parent)
-    try:
-        try:
-            _write_all(fd, text)
-            try:
-                os.fchmod(fd, mode)
-            except Exception:
-                pass
-            try:
-                os.fsync(fd)
-            except Exception:
-                pass
-        finally:
-            os.close(fd)
-        try:
-            os.chmod(tmpname, mode)
-        except Exception:
-            pass
-        os.rename(tmpname, fname)
-        tmpname = None
-        _fsync_dir(parent)
-    finally:
-        if tmpname:
-            try:
-                os.unlink(tmpname)
-            except Exception:
-                pass
-
 
 def sshkey_add(username, ssh_public_key, pubkeyfn):
 
@@ -873,14 +843,14 @@ def main():
             hostname = str(configuration["hostname"])
             if socket.gethostname() != hostname:
                 socket.sethostname(hostname)
-                safe_write_root_file("/etc/hostname", hostname + "\n", 0o644)
+                open("/etc/hostname", "w").write(hostname + "\n")
                 # should set in /etc/hosts as well so
                 # that sudo doesn't complain
                 hosts = open("/etc/hosts").read().split("\n")
                 line = "127.0.0.1 " + hostname + " # set by userify shim"
                 if line not in hosts:
                     hosts.insert(1, line)
-                    safe_write_root_file("/etc/hosts", "\n".join(hosts), 0o644)
+                    open("/etc/hosts", "w").write("\n".join(hosts))
         except Exception as e:
             print(("Unable to set hostname: %s" % e))
 
