@@ -517,6 +517,41 @@ def safe_write_user_file(username, fname, text, mode=0o600, mkdir_path=None):
         fname, status))
 
 
+def safe_write_root_file(fname, text, mode=0o644):
+    """Atomically replace a root-owned regular config file."""
+    parent = os.path.dirname(fname)
+    basename = os.path.basename(fname)
+    if not parent or not basename or basename in (".", ".."):
+        raise Exception("unsafe root file path: %s" % fname)
+    fd, tmpname = tempfile.mkstemp(prefix=".%s.userify-tmp." % basename, dir=parent)
+    try:
+        try:
+            _write_all(fd, text)
+            try:
+                os.fchmod(fd, mode)
+            except Exception:
+                pass
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmpname, mode)
+        except Exception:
+            pass
+        os.rename(tmpname, fname)
+        tmpname = None
+        _fsync_dir(parent)
+    finally:
+        if tmpname:
+            try:
+                os.unlink(tmpname)
+            except Exception:
+                pass
+
+
 def sshkey_add(username, ssh_public_key, pubkeyfn):
 
     if not ssh_public_key:
@@ -838,14 +873,14 @@ def main():
             hostname = str(configuration["hostname"])
             if socket.gethostname() != hostname:
                 socket.sethostname(hostname)
-                open("/etc/hostname", "w").write(hostname + "\n")
+                safe_write_root_file("/etc/hostname", hostname + "\n", 0o644)
                 # should set in /etc/hosts as well so
                 # that sudo doesn't complain
                 hosts = open("/etc/hosts").read().split("\n")
                 line = "127.0.0.1 " + hostname + " # set by userify shim"
                 if line not in hosts:
                     hosts.insert(1, line)
-                    open("/etc/hosts", "w").write("\n").join(hosts)
+                    safe_write_root_file("/etc/hosts", "\n".join(hosts), 0o644)
         except Exception as e:
             print(("Unable to set hostname: %s" % e))
 
