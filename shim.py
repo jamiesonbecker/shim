@@ -12,6 +12,9 @@ except:
 # Standard Library Imports
 import subprocess
 import os
+import errno
+import pwd
+import stat
 import hashlib
 import os.path
 import signal
@@ -305,6 +308,250 @@ def sshkeytext(ssh_public_key):
         ssh_public_key, ""))
 
 
+def _as_bytes(s):
+    """Return bytes for Python 2/3 without changing the external shim contract."""
+    if isinstance(s, type(b"")):
+        return s
+    return s.encode("utf-8")
+
+
+def _write_all(fd, data):
+    data = _as_bytes(data)
+    while data:
+        written = os.write(fd, data)
+        if written == 0:
+            raise IOError("short write")
+        data = data[written:]
+
+
+def _fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except Exception:
+        # Directory fsync is not portable to every ancient target; best effort only.
+        pass
+
+
+def _same_regular_file(path, text, mode=None):
+    """Best-effort same-content check that refuses symlinks/special files."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        return False
+    if getattr(st, "st_nlink", 1) != 1:
+        return False
+    if mode is not None and stat.S_IMODE(st.st_mode) != mode:
+        return False
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+        return False
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = None
+    try:
+        fd = os.open(path, flags)
+        st2 = os.fstat(fd)
+        if not stat.S_ISREG(st2.st_mode):
+            return False
+        if getattr(st2, "st_nlink", 1) != 1:
+            return False
+        if mode is not None and stat.S_IMODE(st2.st_mode) != mode:
+            return False
+        if hasattr(os, "geteuid") and st2.st_uid != os.geteuid():
+            return False
+        desired = _as_bytes(text)
+        chunks = []
+        remaining = len(desired) + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks) == desired
+    except Exception:
+        return False
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _drop_to_user(username):
+    pw = pwd.getpwnam(username)
+    # Clear/rebuild supplementary groups before dropping uid/gid.  Refuse to
+    # continue if we cannot do this; keeping root's supplementary groups would
+    # defeat the purpose of writing user-controlled SSH files as the user.
+    if hasattr(os, "initgroups"):
+        try:
+            os.initgroups(username, pw.pw_gid)
+        except Exception:
+            if hasattr(os, "setgroups"):
+                os.setgroups([pw.pw_gid])
+            else:
+                raise
+    elif hasattr(os, "setgroups"):
+        os.setgroups([pw.pw_gid])
+    else:
+        raise Exception("unable to clear supplementary groups")
+    os.setgid(pw.pw_gid)
+    os.setuid(pw.pw_uid)
+    if os.geteuid() == 0:
+        raise Exception("refusing to write user file as root")
+
+
+def _write_user_file_child(username, fname, text, mode, mkdir_path=None):
+    _drop_to_user(username)
+    old_umask = os.umask(0o077)
+    tmpname = None
+    try:
+        if mkdir_path:
+            try:
+                os.makedirs(mkdir_path, 0o700)
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    raise
+            if not os.path.isdir(mkdir_path):
+                raise Exception("%s is not a directory" % mkdir_path)
+
+        parent = os.path.dirname(fname)
+        basename = os.path.basename(fname)
+        if not parent or not basename or basename in (".", ".."):
+            raise Exception("unsafe user file path: %s" % fname)
+        if not os.path.isdir(parent):
+            raise Exception("%s is not a directory" % parent)
+
+        if _same_regular_file(fname, text, mode):
+            return
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = None
+        for i in range(20):
+            tmpname = os.path.join(parent, ".%s.userify-tmp.%s.%s" % (
+                basename, os.getpid(), random.randrange(1000000000)))
+            try:
+                fd = os.open(tmpname, flags, mode)
+                break
+            except OSError as e:
+                if e.errno == errno.EEXIST:
+                    continue
+                raise
+        if fd is None:
+            raise Exception("unable to create temporary file for %s" % fname)
+        try:
+            _write_all(fd, text)
+            try:
+                os.fchmod(fd, mode)
+            except Exception:
+                pass
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmpname, mode)
+        except Exception:
+            pass
+        os.rename(tmpname, fname)
+        tmpname = None
+        _fsync_dir(parent)
+    finally:
+        os.umask(old_umask)
+        if tmpname:
+            try:
+                os.unlink(tmpname)
+            except Exception:
+                pass
+
+
+def safe_write_user_file(username, fname, text, mode=0o600, mkdir_path=None):
+    """Write a user-owned file without letting root follow user symlinks.
+
+    The parent process stays root, but the child permanently drops to the
+    target user before creating, comparing, or replacing anything under that
+    user's home.  If a user points ~/.ssh or authorized_keys at /root or any
+    other path outside their authority, the write fails instead of becoming a
+    root file-clobber primitive.
+    """
+    pid = os.fork()
+    if pid == 0:
+        try:
+            _write_user_file_child(username, fname, text, mode, mkdir_path)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
+        except Exception as e:
+            print(("Unable to safely write user file %s for %s: %s" % (
+                fname, username, e)))
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+
+    while True:
+        try:
+            waited_pid, status = os.waitpid(pid, 0)
+            break
+        except OSError as e:
+            if e.errno == errno.EINTR:
+                continue
+            raise
+    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0:
+        return
+    if os.WIFSIGNALED(status):
+        raise Exception("safe user file write for %s killed by signal %s" % (
+            fname, os.WTERMSIG(status)))
+    raise Exception("safe user file write for %s failed with status %s" % (
+        fname, status))
+
+
+def safe_write_root_file(fname, text, mode=0o644):
+    """Atomically replace a root-owned regular config file."""
+    parent = os.path.dirname(fname)
+    basename = os.path.basename(fname)
+    if not parent or not basename or basename in (".", ".."):
+        raise Exception("unsafe root file path: %s" % fname)
+    fd, tmpname = tempfile.mkstemp(prefix=".%s.userify-tmp." % basename, dir=parent)
+    try:
+        try:
+            _write_all(fd, text)
+            try:
+                os.fchmod(fd, mode)
+            except Exception:
+                pass
+            try:
+                os.fsync(fd)
+            except Exception:
+                pass
+        finally:
+            os.close(fd)
+        try:
+            os.chmod(tmpname, mode)
+        except Exception:
+            pass
+        os.rename(tmpname, fname)
+        tmpname = None
+        _fsync_dir(parent)
+    finally:
+        if tmpname:
+            try:
+                os.unlink(tmpname)
+            except Exception:
+                pass
+
+
 def sshkey_add(username, ssh_public_key, pubkeyfn):
 
     if not ssh_public_key:
@@ -317,12 +564,9 @@ def sshkey_add(username, ssh_public_key, pubkeyfn):
         print(("DRY RUN: Adding user ssh key %s %s" % (sshpath, ssh_public_key)))
         return
 
-    failsafe_mkdir(sshpath)
     fname = sshpath + pubkeyfn
     text = sshkeytext(ssh_public_key)
-    if not os.path.isfile(fname) or open(fname).read() != text:
-        open(fname, "w").write(text)
-        fullchown(username, sshpath)
+    safe_write_user_file(username, fname, text, 0o600, sshpath)
 
 
 def ssh_privatekey_add(username, ssh_private_keys):
@@ -332,13 +576,9 @@ def ssh_privatekey_add(username, ssh_private_keys):
         if dry_run:
             print(("DRY RUN: Adding user private ssh key %s %s %s" % (sshpath, privname, privkey)))
             return
-        failsafe_mkdir(sshpath)
         fname = sshpath + privname
         text = sshkeytext(privkey)
-        if not os.path.isfile(fname) or open(fname).read() != text:
-            open(fname, "w").write(text)
-            fullchown(username, sshpath)
-            fullchmod("0600", fname)
+        safe_write_user_file(username, fname, text, 0o600, sshpath)
         sshkey_add(username, pubkey, privname + ".pub")
 
 
@@ -633,14 +873,14 @@ def main():
             hostname = str(configuration["hostname"])
             if socket.gethostname() != hostname:
                 socket.sethostname(hostname)
-                open("/etc/hostname", "w").write(hostname + "\n")
+                safe_write_root_file("/etc/hostname", hostname + "\n", 0o644)
                 # should set in /etc/hosts as well so
                 # that sudo doesn't complain
                 hosts = open("/etc/hosts").read().split("\n")
                 line = "127.0.0.1 " + hostname + " # set by userify shim"
                 if line not in hosts:
                     hosts.insert(1, line)
-                    open("/etc/hosts", "w").write("\n").join(hosts)
+                    safe_write_root_file("/etc/hosts", "\n".join(hosts), 0o644)
         except Exception as e:
             print(("Unable to set hostname: %s" % e))
 
